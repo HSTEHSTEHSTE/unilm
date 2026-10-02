@@ -48,6 +48,23 @@ rep, layer_results = model.extract_features(wav_input_16khz, output_layer=model.
 layer_reps = [x.transpose(0, 1) for x, _ in layer_results]
 ```
 
+## Batched single-GPU extraction
+
+`extract_wavlm_features.py` recursively discovers common audio formats (including FLAC), groups similar-duration files into padded batches on one CUDA device, and writes unpooled `(frames, hidden_size)` tensors while preserving the input directory tree. For example:
+
+```bash
+python extract_wavlm_features.py \
+  --input-dir /path/to/audio \
+  --output-dir /path/to/wavlm_features \
+  --model-dir /path/to/wavlm-large \
+  --layer 6 \
+  --skip-existing
+```
+
+At startup, the extractor probes the longest file to find the largest batch that fits on the GPU, then scales batch capacity linearly for shorter files. `--batch-size` is the probe's upper bound (default: 256). Long inputs are never truncated; `--max-batch-seconds` defaults to 30 seconds and caps padded-batch memory. Actual CUDA OOMs are retried as smaller batches.
+
+`launch_librispeech_wavlm.sh` is a CPU-only Slurm controller. It finds the single LibriSpeech tree below `/weka/scratch/jhu/nandrew9`, creates four equal-count FLAC manifests, and submits four A100 jobs via `run_wavlm_gpu_shard.sh`. The jobs use the local Hugging Face model directory and write float16 tensors to scratch.
+
 HuggingFace and [s3prl](https://github.com/s3prl/s3prl) both support our models. It is very easy to fine-tune our models on different downstream tasks. We suggest you to extract representation of each layer and weighted sum the representations. 
 
 ## Universal Representation Evaluation on SUPERB 
