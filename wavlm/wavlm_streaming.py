@@ -57,6 +57,15 @@ def parse_args() -> argparse.Namespace:
                         help="Single CUDA device to use (default: %(default)s).")
     parser.add_argument("--save-dtype", choices=("float16", "float32"), default="float16",
                         help="Dtype used for saved tensors (default: %(default)s).")
+    parser.add_argument(
+        "--normalize-input",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help=(
+            "Apply waveform normalization independently in each streaming window: "
+            "auto follows the local processor configuration (default: %(default)s)."
+        ),
+    )
     parser.add_argument("--skip-existing", action="store_true",
                         help="Do not recompute existing feature files.")
     args = parser.parse_args()
@@ -232,7 +241,12 @@ def main() -> None:
     model_config = copy.deepcopy(full_config)
     model_config.num_hidden_layers = args.output_layer
     model = WavLMModel.from_pretrained(model_dir, config=model_config).eval().to(device)
-    normalize = json.loads((model_dir / "preprocessor_config.json").read_text()).get("do_normalize", False)
+    processor_normalize = json.loads((model_dir / "preprocessor_config.json").read_text()).get("do_normalize", False)
+    normalize = {
+        "auto": processor_normalize,
+        "always": True,
+        "never": False,
+    }[args.normalize_input]
 
     audio_paths = (
         read_file_list(args.file_list.expanduser().resolve(), input_dir)
@@ -254,7 +268,7 @@ def main() -> None:
     print(
         f"Extracting {len(audio_paths)} files on {device}; layer={args.output_layer}; "
         f"step={args.step_frames}; history={args.history_frames}; "
-        f"lookahead={args.lookahead_frames}; output: {output_dir}",
+        f"lookahead={args.lookahead_frames}; normalize={normalize}; output: {output_dir}",
         flush=True,
     )
     for audio_path in tqdm(audio_paths, unit="file"):
