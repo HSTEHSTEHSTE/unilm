@@ -102,5 +102,15 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Slurm submission helpers and scheduler output.  Slurm job scripts are local
+# operational artifacts in this checkout and must not be added to commits.
+**/*.sbatch
+**/*slurm*.sh
+/wavlm/launch_*.sh
+/wavlm/run_*.sh
+*.out
+slurm-*.log
+
 speechlm/dataset/LibriSpeech/fast_phone2unit/dict.PHN.txt
 speechlm/dataset/LibriSpeech/fast_phone2unit/dict.phn.txt
