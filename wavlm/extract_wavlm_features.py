@@ -9,8 +9,6 @@ with shape ``(frames, hidden_size)``; no temporal pooling is applied.
 from __future__ import annotations
 
 import argparse
-import copy
-import json
 import os
 from pathlib import Path
 from typing import Iterable
@@ -18,12 +16,12 @@ from typing import Iterable
 import torch
 import torchaudio
 from tqdm import tqdm
-from transformers import AutoConfig, WavLMModel, logging as transformers_logging
+from WavLM import WavLM
+from official_wavlm import OFFICIAL_WAVLM_LARGE_CHECKPOINT, feature_frame_count, load_official_wavlm_large
 
 
 AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
 TARGET_SAMPLE_RATE = 16_000
-transformers_logging.set_verbosity_error()
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,8 +36,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True,
                         help="Directory in which to mirror feature files.")
-    parser.add_argument("--model-dir", type=Path, required=True,
-                        help="Local Hugging Face WavLM model directory.")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=OFFICIAL_WAVLM_LARGE_CHECKPOINT,
+        help="Microsoft original / bshall-identical WavLM-Large checkpoint.",
+    )
     parser.add_argument("--layer", type=int, default=6,
                         help="One-indexed transformer layer to save (default: %(default)s).")
     parser.add_argument("--device", default="cuda:0",
@@ -155,7 +157,7 @@ def make_batches(
         yield batch
 
 
-def load_waveform(audio_path: Path, normalize: bool) -> torch.Tensor:
+def load_waveform(audio_path: Path) -> torch.Tensor:
     waveform, sample_rate = torchaudio.load(str(audio_path))
     if waveform.numel() == 0:
         raise RuntimeError(f"Empty audio file: {audio_path}")
@@ -164,8 +166,6 @@ def load_waveform(audio_path: Path, normalize: bool) -> torch.Tensor:
     if sample_rate != TARGET_SAMPLE_RATE:
         waveform = torchaudio.functional.resample(waveform, sample_rate, TARGET_SAMPLE_RATE)
     waveform = waveform.to(dtype=torch.float32)
-    if normalize:
-        waveform = torch.nn.functional.layer_norm(waveform, waveform.shape)
     return waveform
 
 
@@ -185,10 +185,11 @@ def is_cuda_oom(error: RuntimeError) -> bool:
 
 
 def probe_batch_size(
-    model: WavLMModel,
+    model: WavLM,
     waveform: torch.Tensor,
     device: torch.device,
     upper_bound: int,
+    layer: int,
 ) -> int:
     """Find the largest batch of the longest input that fits on this GPU."""
     def fits(batch_size: int) -> bool:
@@ -196,7 +197,7 @@ def probe_batch_size(
         padding_mask = torch.zeros(sources.shape, dtype=torch.bool, device=device)
         try:
             with torch.inference_mode():
-                model(sources, attention_mask=(~padding_mask).long())
+                model.extract_features(sources, padding_mask=padding_mask, output_layer=layer)
             torch.cuda.synchronize(device)
             return True
         except RuntimeError as error:
@@ -240,15 +241,15 @@ def probe_batch_size(
 
 
 def extract_batch(
-    model: WavLMModel,
+    model: WavLM,
     paths: list[Path],
-    normalize: bool,
     device: torch.device,
     input_dir: Path,
     output_dir: Path,
     save_dtype: torch.dtype,
+    layer: int,
 ) -> None:
-    waveforms = [load_waveform(path, normalize) for path in paths]
+    waveforms = [load_waveform(path) for path in paths]
     max_samples = max(waveform.shape[1] for waveform in waveforms)
     sources = torch.zeros((len(waveforms), max_samples), dtype=torch.float32, device=device)
     padding_mask = torch.ones((len(waveforms), max_samples), dtype=torch.bool, device=device)
@@ -258,12 +259,10 @@ def extract_batch(
         padding_mask[index, :samples] = False
 
     with torch.inference_mode():
-        embeddings = model(sources, attention_mask=(~padding_mask).long()).last_hidden_state
-    feature_padding_mask = ~model._get_feature_vector_attention_mask(
-        embeddings.shape[1], (~padding_mask).long()
-    )
+        embeddings, _ = model.extract_features(sources, padding_mask=padding_mask, output_layer=layer)
     for index, audio_path in enumerate(paths):
-        features = embeddings[index, ~feature_padding_mask[index]].to("cpu", dtype=save_dtype)
+        valid_frames = feature_frame_count(waveforms[index].shape[1])
+        features = embeddings[index, :valid_frames].to("cpu", dtype=save_dtype)
         save_tensor(features, output_path(audio_path, input_dir, output_dir))
 
 
@@ -271,12 +270,12 @@ def main() -> None:
     args = parse_args()
     input_dir = args.input_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
-    model_dir = args.model_dir.expanduser().resolve()
+    checkpoint_path = args.checkpoint.expanduser().resolve()
 
     if not input_dir.is_dir():
         raise SystemExit(f"Input directory does not exist: {input_dir}")
-    if not model_dir.is_dir():
-        raise SystemExit(f"WavLM model directory does not exist: {model_dir}")
+    if not checkpoint_path.is_file():
+        raise SystemExit(f"Official WavLM checkpoint does not exist: {checkpoint_path}")
 
     device = torch.device(args.device)
     if device.type != "cuda":
@@ -287,16 +286,11 @@ def main() -> None:
         raise SystemExit(f"CUDA device is unavailable: {device}")
     torch.cuda.set_device(device)
 
-    full_config = AutoConfig.from_pretrained(model_dir)
-    if args.layer > full_config.num_hidden_layers:
+    model, full_config = load_official_wavlm_large(checkpoint_path, device)
+    if args.layer > full_config.encoder_layers:
         raise SystemExit(
-            f"--layer {args.layer} exceeds this model's {full_config.num_hidden_layers} encoder layers"
+            f"--layer {args.layer} exceeds this model's {full_config.encoder_layers} encoder layers"
         )
-    model_config = copy.deepcopy(full_config)
-    model_config.num_hidden_layers = args.layer
-    model = WavLMModel.from_pretrained(model_dir, config=model_config).eval().to(device)
-    preprocessor_path = model_dir / "preprocessor_config.json"
-    normalize = json.loads(preprocessor_path.read_text()).get("do_normalize", False)
 
     audio_paths = (
         read_file_list(args.file_list.expanduser().resolve(), input_dir)
@@ -319,9 +313,9 @@ def main() -> None:
         key=lambda item: item[0],
     )
     worst_case_samples, worst_case_path = pending[-1]
-    worst_case_waveform = load_waveform(worst_case_path, normalize)
+    worst_case_waveform = load_waveform(worst_case_path)
     worst_case_batch_size = probe_batch_size(
-        model, worst_case_waveform, device, args.batch_size
+        model, worst_case_waveform, device, args.batch_size, args.layer
     )
     del worst_case_waveform
     torch.cuda.empty_cache()
@@ -339,7 +333,7 @@ def main() -> None:
     def extract_with_oom_retry(paths: list[Path]) -> None:
         try:
             extract_batch(
-                model, paths, normalize, device, input_dir, output_dir, save_dtype
+                model, paths, device, input_dir, output_dir, save_dtype, args.layer
             )
         except RuntimeError as error:
             if not is_cuda_oom(error):

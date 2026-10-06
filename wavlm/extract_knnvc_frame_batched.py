@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract independent one-frame KNN-VC WavLM features in global GPU batches.
+"""Extract independent one-frame original WavLM features in global GPU batches.
 
 Every WavLM invocation contains only 400-sample windows, which produce one
 valid 20-ms feature frame.  Windows from different utterances are packed into
@@ -10,30 +10,17 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torchaudio
 
-
-# KNN-VC Torch Hub imports its bundled ``wavlm`` package.  This checkout has
-# a local module with the same name, so remove the local import roots first.
-SCRIPT_DIRECTORY = Path(__file__).resolve().parent
-PROJECT_DIRECTORY = SCRIPT_DIRECTORY.parent
-sys.path = [
-    entry for entry in sys.path
-    if Path(entry or ".").resolve() not in {SCRIPT_DIRECTORY, PROJECT_DIRECTORY}
-]
-sys.modules.pop("wavlm", None)
+from official_wavlm import OFFICIAL_WAVLM_LARGE_CHECKPOINT, load_official_wavlm_large
 
 SAMPLE_RATE = 16_000
 FEATURE_HOP = 320
 RECEPTIVE_FIELD = 400
-HIDDEN_SIZE = 1024
-
-
 @dataclass
 class UtteranceWork:
     source: Path
@@ -48,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--file-list", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, default=OFFICIAL_WAVLM_LARGE_CHECKPOINT)
     parser.add_argument("--output-layer", type=int, default=6)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--save-dtype", choices=("float16", "float32"), default="float16")
@@ -64,6 +52,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--probe-ceiling-batch must be at least --probe-initial-batch")
     if args.progress_every_batches < 1:
         parser.error("--progress-every-batches must be positive")
+    if not args.checkpoint.expanduser().is_file():
+        parser.error(f"Official WavLM-Large checkpoint does not exist: {args.checkpoint}")
     return args
 
 
@@ -203,17 +193,14 @@ def main() -> None:
         print("No files require extraction.", flush=True)
         return
 
-    model = torch.hub.load(
-        "bshall/knn-vc",
-        "wavlm_large",
-        trust_repo=True,
-        progress=True,
-        device=device,
-    ).eval()
+    checkpoint = args.checkpoint.expanduser().resolve()
+    model, config = load_official_wavlm_large(checkpoint, device)
+    hidden_size = int(config.encoder_embed_dim)
     frame_batch_size = select_largest_batch(model, args, device)
     print(
         f"Selected largest frame batch size: {frame_batch_size}; "
-        f"each item is one {RECEPTIVE_FIELD}-sample WavLM window.",
+        f"each item is one {RECEPTIVE_FIELD}-sample WavLM window; "
+        f"checkpoint={checkpoint}; hidden_size={hidden_size}.",
         flush=True,
     )
 
@@ -240,14 +227,14 @@ def main() -> None:
                 destination = destination_for(source, input_dir, output_dir)
                 windows = load_windows(source)
                 if windows.shape[0] == 0:
-                    save_tensor_atomically(torch.empty((0, HIDDEN_SIZE), dtype=save_dtype), destination)
+                    save_tensor_atomically(torch.empty((0, hidden_size), dtype=save_dtype), destination)
                     completed_files += 1
                     continue
                 current = UtteranceWork(
                     source=source,
                     destination=destination,
                     windows=windows,
-                    features=torch.empty((windows.shape[0], HIDDEN_SIZE), dtype=save_dtype),
+                    features=torch.empty((windows.shape[0], hidden_size), dtype=save_dtype),
                 )
 
             start = current.cursor

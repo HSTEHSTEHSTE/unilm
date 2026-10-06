@@ -11,20 +11,18 @@ used with a shard manifest on a single GPU.
 from __future__ import annotations
 
 import argparse
-import copy
-import json
 import os
 from pathlib import Path
 
 import torch
 import torchaudio
 from tqdm import tqdm
-from transformers import AutoConfig, WavLMModel, logging as transformers_logging
+from WavLM import WavLM
+from official_wavlm import OFFICIAL_WAVLM_LARGE_CHECKPOINT, load_official_wavlm_large
 
 
 SAMPLE_RATE = 16_000
 AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
-transformers_logging.set_verbosity_error()
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,14 +31,18 @@ def parse_args() -> argparse.Namespace:
                         help="Directory containing the input audio tree.")
     parser.add_argument("--output-dir", type=Path, required=True,
                         help="Directory in which to mirror feature files.")
-    parser.add_argument("--model-dir", type=Path, required=True,
-                        help="Local Hugging Face WavLM model directory.")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=OFFICIAL_WAVLM_LARGE_CHECKPOINT,
+        help="Microsoft original / bshall-identical WavLM-Large checkpoint.",
+    )
     parser.add_argument("--file-list", type=Path,
                         help="Optional relative-path manifest for one corpus shard.")
     parser.add_argument("--output-layer", type=int, default=6,
                         help="One-indexed WavLM transformer layer to save (default: %(default)s).")
-    parser.add_argument("--step-frames", type=int, default=10,
-                        help="Feature frames emitted by each pass (default: %(default)s).")
+    parser.add_argument("--chunk-frames", type=int, default=10,
+                        help="Hop-aligned core input duration per pass (default: %(default)s).")
     parser.add_argument("--history-frames", type=int, default=100,
                         help="Prior feature frames available to each pass (default: %(default)s).")
     parser.add_argument("--lookahead-frames", type=int, default=0,
@@ -57,22 +59,13 @@ def parse_args() -> argparse.Namespace:
                         help="Single CUDA device to use (default: %(default)s).")
     parser.add_argument("--save-dtype", choices=("float16", "float32"), default="float16",
                         help="Dtype used for saved tensors (default: %(default)s).")
-    parser.add_argument(
-        "--normalize-input",
-        choices=("auto", "always", "never"),
-        default="auto",
-        help=(
-            "Apply waveform normalization independently in each streaming window: "
-            "auto follows the local processor configuration (default: %(default)s)."
-        ),
-    )
     parser.add_argument("--skip-existing", action="store_true",
                         help="Do not recompute existing feature files.")
     args = parser.parse_args()
     if args.output_layer < 1:
         parser.error("--output-layer must be positive")
-    if args.step_frames < 1:
-        parser.error("--step-frames must be positive")
+    if args.chunk_frames < 2:
+        parser.error("--chunk-frames must be at least two so WavLM emits one valid frame")
     if args.history_frames < 0:
         parser.error("--history-frames must be non-negative")
     if args.lookahead_frames < 0:
@@ -120,15 +113,6 @@ def read_file_list(file_list: Path, input_dir: Path) -> list[Path]:
     return paths
 
 
-def feature_geometry(config) -> tuple[int, int]:
-    hop = 1
-    receptive_field = 1
-    for kernel_size, stride in zip(config.conv_kernel, config.conv_stride, strict=True):
-        receptive_field += (kernel_size - 1) * hop
-        hop *= stride
-    return hop, receptive_field
-
-
 def feature_frame_count(num_samples: int, hop: int, receptive_field: int) -> int:
     if num_samples < receptive_field:
         return 0
@@ -150,35 +134,65 @@ def load_waveform(audio_path: Path, max_samples: int | None) -> torch.Tensor:
 
 def make_streaming_chunks(
     waveform: torch.Tensor,
-    total_frames: int,
-    step_frames: int,
+    chunk_frames: int,
     history_frames: int,
     lookahead_frames: int,
     hop: int,
     receptive_field: int,
-    normalize: bool,
 ) -> list[tuple[torch.Tensor, int, int]]:
+    """Build chunks with anon_baseline's USCF streaming geometry.
+
+    A zero-lookahead core of ``N`` hop-aligned frames contains only ``N - 1``
+    valid WavLM frontend outputs: the last would require the additional
+    80-sample receptive-field tail.  anon_baseline therefore advances by
+    ``N - 1`` frames in that case.  With look-ahead, include that tail and
+    advance by the requested core size.
+    """
     chunks = []
-    for emit_start in range(0, total_frames, step_frames):
-        emit_end = min(emit_start + step_frames, total_frames)
-        input_start = max(0, emit_start - history_frames)
-        input_end = min(total_frames, emit_end + lookahead_frames)
-        sample_start = input_start * hop
-        sample_end = (input_end - 1) * hop + receptive_field
+    chunk_samples = chunk_frames * hop
+    history_samples = history_frames * hop
+    lookahead_samples = lookahead_frames * hop
+    emission_samples = (
+        chunk_samples + lookahead_samples
+        if lookahead_samples
+        else chunk_samples - hop
+    )
+    if emission_samples <= 0:
+        raise ValueError("chunk duration is too short for WavLM's valid convolution")
+
+    waveform_length = waveform.shape[1]
+    for current_start in range(0, waveform_length, emission_samples):
+        core_end = min(current_start + chunk_samples, waveform_length)
+        sample_start = max(0, current_start - history_samples)
+        # This is get_uscf_streaming_chunk_bounds() from anon_baseline:
+        # only explicit look-ahead receives the 80-sample frontend tail.
+        sample_end = min(
+            core_end + lookahead_samples + (receptive_field - hop if lookahead_samples else 0),
+            waveform_length,
+        )
         chunk = waveform[:, sample_start:sample_end]
-        if normalize:
-            # Window-local normalization prevents samples outside this context
-            # from influencing the emitted frames.
-            chunk = torch.nn.functional.layer_norm(chunk, chunk.shape)
-        chunks.append((chunk, emit_start - input_start, emit_end - emit_start))
+        keep_start = (current_start - sample_start) // hop
+        valid_frames = feature_frame_count(chunk.shape[1], hop, receptive_field)
+        keep_frames = valid_frames - keep_start if core_end >= waveform_length else emission_samples // hop
+        if keep_frames < 0:
+            raise RuntimeError("Streaming chunk has a negative emitted frame count")
+        chunks.append((chunk, keep_start, keep_frames))
+        # The final core can end before the next hop-aligned source position.
+        # anon_baseline terminates at this point; continuing would construct a
+        # phantom tail chunk with no valid frame to emit.
+        if core_end >= waveform_length:
+            break
     return chunks
 
 
 def infer_chunks(
-    model: WavLMModel,
+    model: WavLM,
     chunks: list[tuple[torch.Tensor, int, int]],
     batch_size: int,
     device: torch.device,
+    output_layer: int,
+    hop: int,
+    receptive_field: int,
 ) -> torch.Tensor:
     output_parts = []
     for batch_start in range(0, len(chunks), batch_size):
@@ -190,12 +204,12 @@ def infer_chunks(
             samples = chunk.shape[1]
             sources[index, :samples] = chunk[0].to(device)
             padding_mask[index, :samples] = False
-        attention_mask = (~padding_mask).long()
         with torch.inference_mode():
-            embeddings = model(sources, attention_mask=attention_mask).last_hidden_state
-        valid_mask = model._get_feature_vector_attention_mask(embeddings.shape[1], attention_mask)
-        for index, (_, keep_start, keep_frames) in enumerate(batch):
-            valid_frames = int(valid_mask[index].sum().item())
+            embeddings, _ = model.extract_features(
+                sources, padding_mask=padding_mask, output_layer=output_layer
+            )
+        for index, (chunk, keep_start, keep_frames) in enumerate(batch):
+            valid_frames = feature_frame_count(chunk.shape[1], hop, receptive_field)
             if keep_start + keep_frames > valid_frames:
                 raise RuntimeError(
                     "Streaming window produced fewer feature frames than expected: "
@@ -219,11 +233,11 @@ def main() -> None:
     args = parse_args()
     input_dir = args.input_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
-    model_dir = args.model_dir.expanduser().resolve()
+    checkpoint_path = args.checkpoint.expanduser().resolve()
     if not input_dir.is_dir():
         raise SystemExit(f"Input directory does not exist: {input_dir}")
-    if not model_dir.is_dir():
-        raise SystemExit(f"WavLM model directory does not exist: {model_dir}")
+    if not checkpoint_path.is_file():
+        raise SystemExit(f"Official WavLM checkpoint does not exist: {checkpoint_path}")
 
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -232,21 +246,12 @@ def main() -> None:
         raise SystemExit(f"CUDA device is unavailable: {device}")
     torch.cuda.set_device(device)
 
-    full_config = AutoConfig.from_pretrained(model_dir)
-    if args.output_layer > full_config.num_hidden_layers:
+    model, full_config = load_official_wavlm_large(checkpoint_path, device)
+    if args.output_layer > full_config.encoder_layers:
         raise SystemExit(
             f"--output-layer {args.output_layer} exceeds this model's "
-            f"{full_config.num_hidden_layers} encoder layers"
+            f"{full_config.encoder_layers} encoder layers"
         )
-    model_config = copy.deepcopy(full_config)
-    model_config.num_hidden_layers = args.output_layer
-    model = WavLMModel.from_pretrained(model_dir, config=model_config).eval().to(device)
-    processor_normalize = json.loads((model_dir / "preprocessor_config.json").read_text()).get("do_normalize", False)
-    normalize = {
-        "auto": processor_normalize,
-        "always": True,
-        "never": False,
-    }[args.normalize_input]
 
     audio_paths = (
         read_file_list(args.file_list.expanduser().resolve(), input_dir)
@@ -262,32 +267,33 @@ def main() -> None:
         print("No files require extraction.", flush=True)
         return
 
-    hop, receptive_field = feature_geometry(full_config)
+    hop, receptive_field = 320, 400
     max_samples = round(args.max_utterance_seconds * SAMPLE_RATE) if args.max_utterance_seconds else None
     save_dtype = torch.float16 if args.save_dtype == "float16" else torch.float32
     print(
         f"Extracting {len(audio_paths)} files on {device}; layer={args.output_layer}; "
-        f"step={args.step_frames}; history={args.history_frames}; "
-        f"lookahead={args.lookahead_frames}; normalize={normalize}; output: {output_dir}",
+        f"chunk={args.chunk_frames}; history={args.history_frames}; lookahead={args.lookahead_frames}; "
+        f"anon-baseline emission stride="
+        f"{args.chunk_frames + args.lookahead_frames if args.lookahead_frames else args.chunk_frames - 1}; "
+        f"checkpoint={checkpoint_path}; output: {output_dir}",
         flush=True,
     )
     for audio_path in tqdm(audio_paths, unit="file"):
         waveform = load_waveform(audio_path, max_samples)
-        total_frames = feature_frame_count(waveform.shape[1], hop, receptive_field)
-        if total_frames:
+        if feature_frame_count(waveform.shape[1], hop, receptive_field):
             chunks = make_streaming_chunks(
                 waveform,
-                total_frames,
-                args.step_frames,
+                args.chunk_frames,
                 args.history_frames,
                 args.lookahead_frames,
                 hop,
                 receptive_field,
-                normalize,
             )
-            features = infer_chunks(model, chunks, args.batch_size, device)
+            features = infer_chunks(
+                model, chunks, args.batch_size, device, args.output_layer, hop, receptive_field
+            )
         else:
-            features = torch.empty((0, full_config.hidden_size))
+            features = torch.empty((0, full_config.encoder_embed_dim))
         save_tensor(features.to(dtype=save_dtype), output_path(audio_path, input_dir, output_dir))
 
 

@@ -15,7 +15,7 @@ from WavLM import WavLM, WavLMConfig
 
 DEFAULT_CORPORA_DIR = Path('/home/hltcoe/xli/ARTS/Voice-Privacy-Challenge-2024/corpora')
 DEFAULT_SPLIT = Path('LibriSpeech/train-other-360')
-DEFAULT_CHECKPOINT = DEFAULT_CORPORA_DIR / 'pretrained_models/wavlm/WavLM-Large.pt'
+DEFAULT_CHECKPOINT = Path('/weka/scratch/jhu/nandrew9/xli257/models/wavlm/WavLM-Large.official-release.pt')
 AUDIO_SUFFIXES = {'.flac', '.wav'}
 
 

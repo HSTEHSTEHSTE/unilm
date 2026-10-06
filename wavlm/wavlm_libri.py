@@ -85,7 +85,7 @@ for split_dict in splits:
 
     # model
     device = 'cuda'
-    checkpoint = torch.load('/home/hltcoe/xli/ARTS/Voice-Privacy-Challenge-2024/corpora/pretrained_models/wavlm/WavLM-Large.pt')
+    checkpoint = torch.load('/weka/scratch/jhu/nandrew9/xli257/models/wavlm/WavLM-Large.official-release.pt')
     cfg = WavLMConfig(checkpoint['cfg'])
     model = WavLM(cfg)
     model.load_state_dict(checkpoint['model'])
