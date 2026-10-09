@@ -441,9 +441,16 @@ class MultiheadAttention(nn.Module):
         relative_buckets += torch.where(is_small, relative_positions, relative_postion_if_large)
         return relative_buckets
 
-    def compute_bias(self, query_length, key_length):
-        context_position = torch.arange(query_length, dtype=torch.long)[:, None]
-        memory_position = torch.arange(key_length, dtype=torch.long)[None, :]
+    def compute_bias(self, query_length, key_length, query_offset=0, key_offset=0):
+        """Return relative-position bias for absolute query/key ranges.
+
+        Incremental WavLM self-attention prepends cached K/V entries to the
+        current key chunk.  The original implementation restarted both ranges
+        at zero, which made a new query appear to be at the beginning of the
+        full cached sequence.  Offsets preserve the true relative distances.
+        """
+        context_position = torch.arange(query_length, dtype=torch.long)[:, None] + query_offset
+        memory_position = torch.arange(key_length, dtype=torch.long)[None, :] + key_offset
         relative_position = memory_position - context_position
         relative_position_bucket = self._relative_positions_bucket(
             relative_position,
@@ -501,9 +508,21 @@ class MultiheadAttention(nn.Module):
                 assert value is not None
                 assert src_len, bsz == value.shape[:2]
 
+        cached_key_length = 0
+        if incremental_state is not None:
+            existing_state = self._get_input_buffer(incremental_state)
+            if existing_state is not None and existing_state.get("prev_key") is not None:
+                cached_key_length = existing_state["prev_key"].size(2)
+
         if self.has_relative_attention_bias and position_bias is None:
-            position_bias = self.compute_bias(tgt_len, src_len)
-            position_bias = position_bias.unsqueeze(0).repeat(bsz, 1, 1, 1).view(bsz * self.num_heads, tgt_len, src_len)
+            position_bias = self.compute_bias(
+                tgt_len,
+                cached_key_length + src_len,
+                query_offset=cached_key_length,
+            )
+            position_bias = position_bias.unsqueeze(0).repeat(bsz, 1, 1, 1).view(
+                bsz * self.num_heads, tgt_len, cached_key_length + src_len
+            )
 
         if (
                 not is_tpu  # don't use PyTorch version on TPUs
@@ -815,6 +834,19 @@ class MultiheadAttention(nn.Module):
         else:
             empty_result: Dict[str, Optional[Tensor]] = {}
             return empty_result
+
+    def get_incremental_state(self, incremental_state, key):
+        """Minimal Fairseq-compatible storage for this vendored attention module."""
+        if incremental_state is None:
+            return None
+        return incremental_state.get(f"{id(self)}.{key}")
+
+    def set_incremental_state(self, incremental_state, key, value):
+        """Store per-module incremental state without external Fairseq mixins."""
+        if incremental_state is None:
+            return None
+        incremental_state[f"{id(self)}.{key}"] = value
+        return incremental_state
 
     def _set_input_buffer(
             self,
